@@ -1,0 +1,265 @@
+#include <Timer.h>
+#include "DataMsg.h"
+#include "TreeBuilding.h"
+
+module DataCollectionP
+{
+    uses{
+        interface Timer<TMilli> as TimerSend;
+        interface Timer<TMilli> as SendInterval;
+        interface Boot;
+        interface Packet;
+        interface AMPacket;
+        interface AMSend;
+        interface SplitControl as AMControl;
+        interface Receive;
+        interface Random;
+        interface Queue<DataMsg> as Queue;
+        interface Queue<DataMsg> as QueueSend;
+        interface TreeConnection;
+    }
+}
+implementation
+{
+
+    message_t pkt;
+    bool send;
+    parent_data parent_buf[BUFFER_SIZE];
+    uint8_t address;
+    num_msg num_buffer[BUFFER_SIZE];
+    uint8_t seq_no;
+    uint8_t cost;
+    uint8_t num_drop_msg;
+
+    task void forwardMessage();
+
+    void sort( parent_data p_b[BUFFER_SIZE] )
+    {
+         uint8_t i;
+         address = INF;
+         for (i = 0; i < (BUFFER_SIZE); ++i)
+		 {
+		      if(address > p_b[i].parent)
+		      	address = p_b[i].parent;
+		 }
+    }
+    
+
+    event void Boot.booted(){
+        send = FALSE;
+        seq_no = INF;
+        address = INF;
+        cost = INF;
+        if(!TOS_NODE_ID == 0){
+            memset (parent_buf, 0, sizeof(parent_data) * BUFFER_SIZE);
+            memset (num_buffer, 0, sizeof(num_msg) * BUFFER_SIZE);
+        }
+        call AMControl.start();
+    }
+
+    event void AMControl.startDone(error_t err){
+        if (err == SUCCESS)
+        {
+            //periodicali send messages
+            if(TOS_NODE_ID != 0)
+            	call SendInterval.startPeriodic(R_R_PERIOD);
+        }
+        if (err != SUCCESS)
+            call AMControl.start();
+    }
+
+    event void AMControl.stopDone(error_t err){}
+
+    task void forwardMessage(){
+    	if(send == TRUE){
+    		dbg("routing", "Waiting\n");
+    		//resending random time
+    		call TimerSend.startOneShot(call Random.rand16()%80);
+    	}
+    	else
+    	{	
+    		uint8_t queue_size = call QueueSend.size();
+    		if(queue_size > 0){
+    			error_t error;
+          		DataMsg* dataMsg = (DataMsg*) (call Packet.getPayload(&pkt, NULL));
+          		DataMsg temp = (DataMsg) call QueueSend.head();
+          		*dataMsg = temp;
+
+        		//dbg("routing", "%u - %u  \n",dataMsg->data ,dataMsg->source);
+        		
+        		
+        		if ((error = call AMSend.send(temp.address, &pkt ,sizeof(DataMsg))) == SUCCESS){
+        		    send = TRUE;
+        		    dbg("routing", "Sending messagge to %u----> source: %u | address: %u \n",temp.address,temp.source,temp.address);
+        		} 
+        		else {
+        		    dbg("routing", "\n\n\n\nERROR\t%u\n", error);
+                    send = FALSE;
+        		}
+            }
+        }
+    }
+
+  event void AMSend.sendDone(message_t* msg, error_t error)
+  {
+  	if (error == SUCCESS){  
+        uint8_t i = 0;    
+    	send = FALSE;
+        call QueueSend.dequeue();
+        for(i = 0; i < BUFFER_SIZE ; i++){
+            
+            if ( call AMPacket.destination(msg) == num_buffer[i].parent )
+            {
+                num_buffer[i].num_msg_send++;
+            }
+        }
+        if( call QueueSend.size() > 0 ){
+        	call TimerSend.startOneShot(call Random.rand16()%100);
+        }
+        else
+        {
+            dbg("routing", "------------------ Stop sending messages --------------\n");
+            for(i  = 0; i < BUFFER_SIZE; i++)
+            {
+                if( num_buffer[i].parent != INF )
+                    dbg("routing", "num_msg_send: %u | parent: %u \n", num_buffer[i].num_msg_send, num_buffer[i].parent);
+            }
+            dbg("routing", "num_drop_meg : %u \n",num_drop_msg);
+        }
+    }
+    else
+  	{
+  		send = FALSE;
+  		dbg("routing", "\n\n\n\nERROR\t%u\n", error);
+  		call TimerSend.startOneShot(call Random.rand16()%80);
+  	}
+  }
+
+  event message_t* Receive.receive(message_t* msg, void* payload, uint8_t len)
+  { 
+  	uint8_t queue_size = 0;
+    if (len == sizeof(DataMsg)){
+    DataMsg* recivedMsg = (DataMsg*) payload;
+        if( TOS_NODE_ID == 0 ){
+            dbg("routing", "Message arrived at the sink---> source:%u | address:%u \n",recivedMsg->source,recivedMsg->address);
+        }
+        else{
+            //salva il messaggio in coda
+            queue_size = call Queue.size();
+            if((queue_size+1) < Q_SIZE){
+                call Queue.enqueue( *((DataMsg*) recivedMsg ));
+                dbg("routing", "Data recieved---> source:%u | address:%u \n", recivedMsg->source, recivedMsg->address);
+            }
+            else{
+                num_drop_msg ++;
+            }
+        }
+    		
+    }
+    return msg;
+  }
+
+
+    event void SendInterval.fired(){
+        //I have to send messagges to my parent
+        while(call Queue.size() > 0) {
+            if(address != INF){
+                DataMsg temp_msg;
+                temp_msg = call Queue.dequeue();
+                temp_msg.address = address;
+                dbg("routing", "%u send message to address %u \n",TOS_NODE_ID,temp_msg.address);
+                call QueueSend.enqueue(temp_msg);    
+            }else{
+                call Queue.dequeue();
+                dbg("routing", "----------No parent, clearing queue!!--------- \n");
+            }
+        }
+        call TimerSend.startOneShot(call Random.rand16()%200);
+    }
+
+    event void TimerSend.fired(){
+        if (!send ){
+            post forwardMessage();
+        }   
+    }
+
+    event void TreeConnection.parentUpdate(parent_data parent_b[BUFFER_SIZE]){
+        memcpy(parent_buf,parent_b, sizeof(parent_data) * BUFFER_SIZE );
+        
+        if( seq_no != parent_buf[0].seq_no ){
+       		uint8_t i = 0;
+            DataMsg temp_msg;
+            seq_no = parent_buf[0].seq_no;
+            cost = parent_buf[0].cost;
+            num_drop_msg = 0;
+            dbg("routing", "New Tree costruction\n");
+
+            temp_msg.source = TOS_NODE_ID;
+            temp_msg.address = INF;
+
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+            call Queue.enqueue(temp_msg);
+
+
+            for(i = 0; i < BUFFER_SIZE; i ++){
+	            if( parent_buf[i].parent != INF ){
+                    address = parent_buf[i].parent;
+                    dbg("routing","ADDRESS = %u \n",address); 
+	                num_buffer[i].parent = parent_buf[i].parent;
+	                num_buffer[i].num_msg_send = 0;
+	                dbg("routing","Cost = %u\t Seq_no = %u\t Parent = %u\n",parent_buf[i].cost,parent_buf[i].seq_no,parent_buf[i].parent);
+	            }
+	            else{
+	                num_buffer[i].parent = INF;
+	                num_buffer[i].num_msg_send = 0;
+	            }
+	        }
+        }
+        else{
+        	uint8_t i = 0;
+        	DataMsg temp_msg;
+        	dbg("routing","new parent found\n");
+
+            sort(parent_buf);
+
+            dbg("routing","ADDRESS = %u \n",address); 
+        	
+        	if(  cost > parent_buf[0].cost ){
+                cost = parent_buf[0].cost;
+        		//I found a parent with a less cost
+        		for(i = 0; i < BUFFER_SIZE; i ++){
+		        	if( parent_buf[i].parent != INF )
+		        	{
+	                	dbg("routing","Cost = %u\t Seq_no = %u\t Parent = %u\n",parent_buf[i].cost,parent_buf[i].seq_no,parent_buf[i].parent); 
+		        		num_buffer[i].parent = parent_buf[i].parent;
+	                	num_buffer[i].num_msg_send = 0;
+		            }
+		            else{
+		            	num_buffer[i].parent = INF;
+	                	num_buffer[i].num_msg_send = 0;
+					}
+		        }
+        	}
+        	else{
+				for(i = 0; i < BUFFER_SIZE; i ++){
+		        	if( parent_buf[i].parent != INF )
+		        	{
+	                	dbg("routing","Cost = %u\t Seq_no = %u\t Parent = %u\n",parent_buf[i].cost,parent_buf[i].seq_no,parent_buf[i].parent);
+		        		if( parent_buf[i].parent != num_buffer[i].parent ){
+			            	num_buffer[i].parent = parent_buf[i].parent;
+	                		num_buffer[i].num_msg_send = 0;
+	            		}
+		            }
+		        }	        	
+        	}
+	   	}
+    }
+}
